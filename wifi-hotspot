@@ -1,0 +1,318 @@
+#!/usr/bin/env bash
+# wifi-hotspot - run a Wi-Fi hotspot while staying connected to Wi-Fi, on ONE Wi-Fi card (Linux).
+# Creates a virtual AP interface next to your Wi-Fi interface and runs hostapd + dnsmasq on it.
+# https://github.com/rajmehta28599/linux-mobile-hotspot   License: MIT
+set -euo pipefail
+
+VERSION=1.0.0
+CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/wifi-hotspot"
+SETTINGS="$CONF_DIR/settings"
+RUN_DIR="$CONF_DIR/run"
+
+# ---------- defaults (overridden by settings file) ----------
+SSID="LinuxHotspot"
+PASSWORD="change-me-please"
+BAND=auto            # auto | 2.4 | 5   (only used when Wi-Fi is disconnected)
+SECURITY=wpa2        # wpa2 | wpa3 | wpa2-wpa3 | open
+WIFI_IFACE=""        # empty = auto-detect
+AP_IFACE=ap0
+SUBNET=192.168.50    # hotspot clients get $SUBNET.10 - $SUBNET.100
+DNS="8.8.8.8,1.1.1.1"
+# shellcheck disable=SC1090
+[ -f "$SETTINGS" ] && source "$SETTINGS"
+
+# Without a TTY (e.g. launched from the GUI), use SUDO_ASKPASS for the password prompt.
+SUDO=sudo
+[ -t 0 ] || { [ -n "${SUDO_ASKPASS:-}" ] && SUDO="sudo -A"; }
+
+# ---------- helpers ----------
+if [ -t 1 ]; then G=$'\e[32m'; R=$'\e[31m'; Y=$'\e[33m'; B=$'\e[1m'; N=$'\e[0m'; else G= R= Y= B= N=; fi
+ok()   { echo "  ${G}[ OK ]${N} $*"; }
+bad()  { echo "  ${R}[FAIL]${N} $*"; FAILS=$((FAILS+1)); }
+warn() { echo "  ${Y}[WARN]${N} $*"; }
+info() { echo "  [INFO] $*"; }
+die()  { echo "${R}ERROR:${N} $*" >&2; exit 1; }
+has()  { command -v "$1" >/dev/null 2>&1; }
+
+detect_wifi() {
+  [ -n "$WIFI_IFACE" ] && { echo "$WIFI_IFACE"; return; }
+  iw dev 2>/dev/null | awk -v ap="$AP_IFACE" '/Interface/{i=$2} /type managed/ && i!=ap {print i; exit}'
+}
+phy_of()   { iw dev "$1" info 2>/dev/null | awk '/wiphy/{print "phy"$2; exit}'; }
+channel_of() { iw dev "$1" info 2>/dev/null | awk '/channel/{print $2; exit}'; }
+# Derive a unique MAC for the AP: same as Wi-Fi MAC but with the locally-administered bit set.
+ap_mac() {
+  local mac first
+  mac=$(cat "/sys/class/net/$1/address")
+  first=$(( 0x${mac%%:*} | 0x02 ))
+  [ "$first" -eq $(( 0x${mac%%:*} )) ] && first=$(( first ^ 0x04 ))
+  printf '%02x:%s' "$first" "${mac#*:}"
+}
+# Line for 2.4/5 GHz channel $2 from 'iw phy' (6 GHz reuses channel numbers, so skip >= 5950 MHz).
+channel_line() {
+  iw phy "$1" info 2>/dev/null | awk -v c="[$2]" '$2+0 > 0 && $2+0 < 5950 && $3 == "MHz" && $4 == c {print; exit}'
+}
+channel_exists() { [ -n "$(channel_line "$1" "$2")" ]; }
+# Returns restriction flags for a channel ("no IR", "radar detection", "disabled"); empty = hotspot allowed.
+channel_flags() {
+  channel_line "$1" "$2" | grep -oE 'no IR|radar detection|disabled' | sort -u | tr '\n' ' ' || true
+}
+pkg_hint() {
+  local id=""; [ -f /etc/os-release ] && id=$(. /etc/os-release; echo "${ID} ${ID_LIKE:-}")
+  case "$id" in
+    *debian*|*ubuntu*) echo "sudo apt install $*" ;;
+    *fedora*|*rhel*)   echo "sudo dnf install $*" ;;
+    *arch*)            echo "sudo pacman -S $*" ;;
+    *suse*)            echo "sudo zypper install $*" ;;
+    *)                 echo "install with your package manager: $*" ;;
+  esac
+}
+
+# ---------- check ----------
+cmd_check() {
+  FAILS=0
+  echo "${B}wifi-hotspot $VERSION - compatibility check${N}"
+  echo
+  echo "${B}System${N}"
+  if [ "$(uname -s)" != Linux ]; then
+    bad "This tool is for Linux. On Windows 10/11 use Settings > Network > Mobile hotspot. See README for macOS."
+    return 1
+  fi
+  local os="unknown"; [ -f /etc/os-release ] && os=$(. /etc/os-release; echo "$PRETTY_NAME")
+  info "OS: $os, kernel $(uname -r)"
+
+  echo; echo "${B}Required tools${N}"
+  local missing=()
+  for t in iw hostapd dnsmasq iptables ip; do
+    if has "$t"; then ok "$t found"; else bad "$t not found"; [ "$t" = ip ] && t=iproute2; missing+=("$t"); fi
+  done
+  [ ${#missing[@]} -gt 0 ] && info "Install: $(pkg_hint "${missing[@]}")"
+  has iw || { echo; echo "Cannot check hardware without 'iw'."; return 1; }
+
+  echo; echo "${B}Wi-Fi hardware${N}"
+  local wifi phy
+  wifi=$(detect_wifi)
+  if [ -z "$wifi" ]; then bad "No Wi-Fi interface in 'managed' mode found"; return 1; fi
+  phy=$(phy_of "$wifi")
+  ok "Wi-Fi interface: $wifi ($phy)"
+  local drv; drv=$(basename "$(readlink -f "/sys/class/net/$wifi/device/driver" 2>/dev/null)" 2>/dev/null || true)
+  [ -n "$drv" ] && info "Driver: $drv"
+
+  local phyinfo; phyinfo=$(iw phy "$phy" info)
+  if echo "$phyinfo" | awk '/Supported interface modes/{f=1;next} f&&/^\t\t[^ \t*]/{f=0} f' | grep -q '\* AP$'; then
+    ok "Card supports AP (hotspot) mode"
+  else
+    bad "Card does NOT support AP mode - no hotspot possible with this card"
+  fi
+
+  local combos; combos=$(echo "$phyinfo" | awk '/valid interface combinations/{f=1;next} f&&/^\t[A-Z]/{f=0} f' | tr -s ' \t\n' ' ' | sed 's/\* #/\n#/g')
+  local both; both=$(echo "$combos" | grep 'managed' | grep -E '[{ ,]AP[ ,}]' || true)
+  if [ -n "$both" ]; then
+    ok "Card allows Wi-Fi client + hotspot at the same time"
+    if echo "$both" | grep -qE '#channels <= 1'; then
+      info "Both must use the SAME channel (hotspot follows your Wi-Fi's channel automatically)"
+    else
+      info "Card allows different channels for Wi-Fi and hotspot (tool still uses the same channel for reliability)"
+    fi
+  else
+    bad "Card does NOT allow client + AP at the same time (no 'managed' + 'AP' interface combination)"
+    info "Workaround: use a second USB Wi-Fi adapter, or share a wired connection instead"
+  fi
+
+  echo; echo "${B}Current connection${N}"
+  local ch; ch=$(channel_of "$wifi")
+  if [ -z "$ch" ]; then
+    info "Wi-Fi not connected - hotspot will use BAND=$BAND"
+  else
+    local band="2.4 GHz"; [ "$ch" -gt 14 ] && band="5 GHz"
+    info "Wi-Fi connected on $band, channel $ch"
+    local fl; fl=$(channel_flags "$phy" "$ch")
+    if [ -z "$fl" ]; then ok "Hotspot is allowed on channel $ch"
+    else
+      warn "Hotspot NOT allowed on channel $ch (${fl% }) - regulatory restriction on the current channel"
+      local con=""; has nmcli && con=$(nmcli -t -f NAME,DEVICE connection show --active 2>/dev/null | awk -F: -v d="$wifi" '$2==d{print $1; exit}')
+      info "Fix: use 2.4 GHz for the Wi-Fi connection, e.g.: nmcli connection modify '${con:-<connection>}' 802-11-wireless.band bg && nmcli connection up '${con:-<connection>}'"
+    fi
+  fi
+  local ap5=() c
+  for c in 36 40 44 48 149 153 157 161 165; do channel_exists "$phy" "$c" && [ -z "$(channel_flags "$phy" "$c")" ] && ap5+=("$c"); done
+  if [ ${#ap5[@]} -gt 0 ]; then info "5 GHz channels where a hotspot is allowed: ${ap5[*]}"
+  else info "No 5 GHz channel currently allows a hotspot on this card/region - use 2.4 GHz"; fi
+  info "Allowed channels can change at runtime (e.g. Intel LAR updates them from detected country)"
+
+  echo; echo "${B}Network services${N}"
+  if has nmcli && systemctl is-active --quiet NetworkManager 2>/dev/null; then ok "NetworkManager running (tool tells it to ignore $AP_IFACE)"
+  else info "NetworkManager not running (fine)"; fi
+  if systemctl is-active --quiet firewalld 2>/dev/null; then
+    warn "firewalld is active - the tool adds $AP_IFACE to the 'trusted' zone and enables masquerade (UNTESTED)"
+  elif has ufw && systemctl is-active --quiet ufw 2>/dev/null; then ok "ufw active (supported - tool inserts iptables rules)"
+  else ok "No managed firewall detected"; fi
+
+  echo; echo "${B}Settings${N}"
+  if [ -f "$SETTINGS" ]; then ok "Settings file: $SETTINGS"; else warn "No settings file yet - run install.sh or copy settings.example to $SETTINGS"; fi
+  [ "$PASSWORD" = "change-me-please" ] && warn "PASSWORD is still the default - change it in $SETTINGS"
+
+  echo
+  if [ "$FAILS" -eq 0 ]; then echo "${G}${B}Your system is supported.${N} Run: wifi-hotspot start"
+  else echo "${R}${B}$FAILS check(s) failed.${N} See README > Troubleshooting."; return 1; fi
+}
+
+# ---------- start ----------
+cmd_start() {
+  for t in iw hostapd dnsmasq iptables ip; do has "$t" || die "'$t' missing. Run: wifi-hotspot check"; done
+  [ "$SECURITY" = open ] || { [ ${#PASSWORD} -ge 8 ] && [ ${#PASSWORD} -le 63 ]; } || die "PASSWORD must be 8-63 characters ($SETTINGS)"
+  [ ${#SSID} -ge 1 ] && [ ${#SSID} -le 32 ] || die "SSID must be 1-32 characters ($SETTINGS)"
+  case "$SECURITY" in wpa2|wpa3|wpa2-wpa3|open) ;; *) die "SECURITY must be wpa2, wpa3, wpa2-wpa3 or open";; esac
+  [ "$PASSWORD" = "change-me-please" ] && echo "${Y}WARNING:${N} using the default password - change it in $SETTINGS"
+
+  local wifi phy ch mode
+  wifi=$(detect_wifi); [ -n "$wifi" ] || die "No Wi-Fi interface found"
+  phy=$(phy_of "$wifi")
+  ch=$(channel_of "$wifi")
+  if [ -n "$ch" ]; then
+    [ "$BAND" = 2.4 ] && [ "$ch" -gt 14 ] && echo "NOTE: Wi-Fi is on 5 GHz (ch $ch); hotspot must use the same channel, BAND=2.4 ignored."
+    [ "$BAND" = 5 ] && [ "$ch" -le 14 ] && echo "NOTE: Wi-Fi is on 2.4 GHz (ch $ch); hotspot must use the same channel, BAND=5 ignored."
+  else
+    case "$BAND" in
+      5) ch=""; local c; for c in 149 153 157 161 36 40 44 48; do channel_exists "$phy" "$c" && [ -z "$(channel_flags "$phy" "$c")" ] && { ch=$c; break; }; done
+         [ -n "$ch" ] || die "No 5 GHz channel allows a hotspot on this card/region. Use BAND=2.4" ;;
+      *) ch=6 ;;
+    esac
+  fi
+  local fl; fl=$(channel_flags "$phy" "$ch")
+  [ -z "$fl" ] || die "Hotspot not allowed on channel $ch ($fl). Connect your Wi-Fi to a 2.4 GHz network and retry."
+  if [ "$ch" -le 14 ]; then mode=g; else mode=a; fi
+
+  $SUDO -v || die "sudo authentication failed or was cancelled (without a terminal, set SUDO_ASKPASS)"
+  mkdir -p "$RUN_DIR"; chmod 700 "$CONF_DIR" "$RUN_DIR"
+  cmd_stop quiet
+
+  # Tell NetworkManager to leave the AP interface alone (otherwise it flips it to 'managed' -> "Device or resource busy")
+  local rule=/etc/udev/rules.d/90-wifi-hotspot-unmanaged.rules
+  local line="ACTION==\"add\", SUBSYSTEM==\"net\", KERNEL==\"$AP_IFACE\", ENV{NM_UNMANAGED}=\"1\""
+  if ! grep -qsF "$line" "$rule"; then $SUDO install -m 644 /dev/stdin "$rule" <<< "$line"; $SUDO udevadm control --reload; fi
+
+  $SUDO iw dev "$wifi" interface add "$AP_IFACE" type __ap addr "$(ap_mac "$wifi")"
+  sleep 1
+  has nmcli && nmcli device set "$AP_IFACE" managed no >/dev/null 2>&1 || true
+
+  {
+    echo "interface=$AP_IFACE"; echo "driver=nl80211"; echo "ssid=$SSID"
+    echo "hw_mode=$mode"; echo "channel=$ch"; echo "ieee80211n=1"
+    [ "$mode" = a ] && echo "ieee80211ac=1"
+    echo "wmm_enabled=1"; echo "auth_algs=1"
+    case "$SECURITY" in
+      open) ;;
+      wpa3) printf '%s\n' wpa=2 wpa_key_mgmt=SAE rsn_pairwise=CCMP ieee80211w=2 sae_pwe=2 "sae_password=$PASSWORD" ;;
+      wpa2-wpa3) printf '%s\n' wpa=2 "wpa_key_mgmt=WPA-PSK SAE" rsn_pairwise=CCMP ieee80211w=1 sae_pwe=2 "wpa_passphrase=$PASSWORD" "sae_password=$PASSWORD" ;;
+      *) printf '%s\n' wpa=2 wpa_key_mgmt=WPA-PSK rsn_pairwise=CCMP "wpa_passphrase=$PASSWORD" ;;
+    esac
+  } > "$RUN_DIR/hostapd.conf"
+  chmod 600 "$RUN_DIR/hostapd.conf"
+
+  $SUDO ip addr flush dev "$AP_IFACE"
+  $SUDO ip addr add "$SUBNET.1/24" dev "$AP_IFACE"
+  $SUDO hostapd -B -P "$RUN_DIR/hostapd.pid" "$RUN_DIR/hostapd.conf" >/dev/null || die "hostapd failed. Debug with: $SUDO hostapd -d $RUN_DIR/hostapd.conf"
+  sleep 2
+  $SUDO dnsmasq --conf-file=/dev/null --interface="$AP_IFACE" --bind-interfaces --except-interface=lo \
+    --listen-address="$SUBNET.1" --dhcp-range="$SUBNET.10,$SUBNET.100,12h" --dhcp-option="6,$DNS" \
+    --dhcp-leasefile="$RUN_DIR/dnsmasq.leases" --pid-file="$RUN_DIR/dnsmasq.pid"
+
+  $SUDO sysctl -qw net.ipv4.ip_forward=1
+  fw add "$wifi"
+  echo "$wifi" > "$RUN_DIR/wifi_iface"
+  printf 'SSID=%q\nCHANNEL=%s\nSECURITY=%s\nWIFI_IFACE=%s\nAP_IFACE=%s\nSUBNET=%s\nSTARTED=%s\n' \
+    "$SSID" "$ch" "$SECURITY" "$wifi" "$AP_IFACE" "$SUBNET" "$(date +%s)" > "$RUN_DIR/state"
+
+  local band="2.4 GHz"; [ "$mode" = a ] && band="5 GHz"
+  echo "${G}Hotspot '$SSID' is ON${N} - $band, channel $ch, security $SECURITY, sharing internet from $wifi."
+}
+
+# iptables rules (+ firewalld zone if active). $1 = add|del, $2 = upstream iface
+fw() {
+  local op=$1 up=$2 a
+  ipt() { # ipt <table> <chain> <rule...> : idempotent add / delete
+    local t=$1 c=$2; shift 2
+    if [ "$op" = add ]; then $SUDO iptables -t "$t" -C "$c" "$@" 2>/dev/null || $SUDO iptables -t "$t" -I "$c" "$@"
+    else while $SUDO iptables -t "$t" -D "$c" "$@" 2>/dev/null; do :; done; fi
+  }
+  ipt nat POSTROUTING -s "$SUBNET.0/24" -o "$up" -j MASQUERADE
+  ipt filter FORWARD -i "$AP_IFACE" -o "$up" -j ACCEPT
+  ipt filter FORWARD -i "$up" -o "$AP_IFACE" -m state --state RELATED,ESTABLISHED -j ACCEPT
+  ipt filter INPUT -i "$AP_IFACE" -j ACCEPT
+  if systemctl is-active --quiet firewalld 2>/dev/null; then
+    a=$([ "$op" = add ] && echo add || echo remove)
+    $SUDO firewall-cmd -q --zone=trusted --"$a"-interface="$AP_IFACE" 2>/dev/null || true
+    local z; z=$($SUDO firewall-cmd --get-zone-of-interface="$up" 2>/dev/null || echo public)
+    [ "$op" = add ] && $SUDO firewall-cmd -q --zone="$z" --add-masquerade 2>/dev/null || true
+  fi
+}
+
+# ---------- stop ----------
+cmd_stop() {
+  local quiet=${1:-}
+  # Authenticate once up front; otherwise a cancelled prompt is repeated for every sudo call below.
+  [ -n "$quiet" ] || $SUDO -v || die "sudo authentication failed or was cancelled (without a terminal, set SUDO_ASKPASS)"
+  [ -d "$RUN_DIR" ] || mkdir -p "$RUN_DIR"
+  # dnsmasq runs as 'nobody' and cannot delete its pid file in this 700 directory, so a pid file
+  # can be stale and its PID reused by an unrelated process: only signal a matching process name.
+  $SUDO pkill -F "$RUN_DIR/hostapd.pid" -x hostapd 2>/dev/null || true
+  $SUDO pkill -F "$RUN_DIR/dnsmasq.pid" -x dnsmasq 2>/dev/null || true
+  rm -f "$RUN_DIR/hostapd.pid" "$RUN_DIR/dnsmasq.pid"
+  local up; up=$(cat "$RUN_DIR/wifi_iface" 2>/dev/null || detect_wifi)
+  [ -n "$up" ] && fw del "$up"
+  $SUDO iw dev "$AP_IFACE" del 2>/dev/null || true
+  rm -f "$RUN_DIR/wifi_iface" "$RUN_DIR/state"
+  [ -z "$quiet" ] && echo "Hotspot stopped."
+  return 0
+}
+
+# ---------- status ----------
+cmd_status() {
+  local apinfo; apinfo=$(iw dev "$AP_IFACE" info 2>/dev/null || true)
+  if echo "$apinfo" | grep -q 'type AP' && ! echo "$apinfo" | grep -q 'ssid'; then
+    echo "${Y}Hotspot INTERRUPTED${N} - the Wi-Fi connection changed channel; run: wifi-hotspot restart"
+  elif echo "$apinfo" | grep -q 'type AP'; then
+    echo "${G}Hotspot ON${N}"
+    iw dev "$AP_IFACE" info | grep -E 'ssid|channel' | sed 's/^\s*/  /'
+    local macs; macs=$(iw dev "$AP_IFACE" station dump 2>/dev/null | awk '/^Station/{print $2}')
+    echo "  connected devices: $(echo -n "$macs" | grep -c . || true)"
+    local m ip name
+    for m in $macs; do
+      ip=$(awk -v m="$m" 'tolower($2)==m{print $3}' "$RUN_DIR/dnsmasq.leases" 2>/dev/null)
+      name=$(awk -v m="$m" 'tolower($2)==m{print $4}' "$RUN_DIR/dnsmasq.leases" 2>/dev/null)
+      echo "    $m  ${ip:--}  ${name:--}"
+    done
+  else
+    echo "Hotspot OFF"
+  fi
+  local wifi; wifi=$(detect_wifi)
+  [ -n "$wifi" ] && echo "  Wi-Fi ($wifi): $(iw dev "$wifi" link | awk -F': ' '/SSID/{print "connected to "$2; f=1} END{if(!f) print "not connected"}')"
+}
+
+usage() {
+  cat <<USAGE
+wifi-hotspot $VERSION - Wi-Fi hotspot + Wi-Fi connection at the same time on one card
+
+Usage: wifi-hotspot <command>
+  check     Check if your OS / Wi-Fi card supports it (no sudo needed)
+  start     Start (or restart) the hotspot
+  restart   Same as start
+  stop      Stop the hotspot
+  status    Show hotspot state and connected devices
+  config    Open the settings file in your editor
+
+Settings: $SETTINGS
+USAGE
+}
+
+case "${1:-}" in
+  check)  cmd_check ;;
+  start)  cmd_start ;;
+  stop)   cmd_stop ;;
+  restart) cmd_start ;;
+  status) cmd_status ;;
+  config) mkdir -p "$CONF_DIR"; "${EDITOR:-nano}" "$SETTINGS" ;;
+  -v|--version) echo "$VERSION" ;;
+  *) usage ;;
+esac

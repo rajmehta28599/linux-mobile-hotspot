@@ -1,0 +1,7 @@
+# never commit real settings (contains your password)
+settings
+run/
+*.pid
+*.leases
+hostapd.conf
+__pycache__/

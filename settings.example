@@ -1,0 +1,28 @@
+# wifi-hotspot settings
+# Location: ~/.config/wifi-hotspot/settings   (edit with: wifi-hotspot config)
+# After editing, apply with: wifi-hotspot restart
+# Use single quotes if a value contains $ ` " or \   e.g. PASSWORD='pa$$word'
+
+# Network name shown on phones (1-32 characters)
+SSID="LinuxHotspot"
+
+# Password (8-63 characters). CHANGE THIS. Generate one with: openssl rand -base64 12
+PASSWORD="change-me-please"
+
+# Band: auto | 2.4 | 5
+#   While your Wi-Fi is connected, the hotspot MUST use the same channel as your Wi-Fi
+#   (single-radio hardware limit), so BAND only applies when Wi-Fi is disconnected.
+BAND=auto
+
+# Security: wpa2 | wpa3 | wpa2-wpa3 | open
+#   wpa2       WPA2-Personal (AES-CCMP)   - works with every device (default)
+#   wpa3       WPA3-Personal (SAE + PMF)  - strongest, every device must support WPA3
+#   wpa2-wpa3  transition mode            - WPA3 where supported, WPA2 for older devices
+#   open       no password                - not recommended
+SECURITY=wpa2
+
+# --- Advanced (usually leave as is) ---
+# WIFI_IFACE=""         # your Wi-Fi interface; empty = auto-detect (e.g. wlan0, wlo1, wlp2s0)
+# AP_IFACE=ap0          # name of the virtual hotspot interface
+# SUBNET=192.168.50     # hotspot clients get 192.168.50.10 - .100
+# DNS="8.8.8.8,1.1.1.1" # DNS servers given to hotspot clients

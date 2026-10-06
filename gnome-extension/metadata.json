@@ -1,0 +1,8 @@
+{
+  "uuid": "wifi-hotspot@linux-mobile-hotspot",
+  "name": "Linux Mobile Hotspot",
+  "description": "Quick Settings toggle for wifi-hotspot: run a hotspot while staying connected to Wi-Fi, and list the connected devices. Requires the wifi-hotspot CLI and wifi-hotspot-gui.",
+  "shell-version": ["45", "46", "47", "48", "49", "50"],
+  "version-name": "1.0.0",
+  "url": "https://github.com/rajmehta28599/linux-mobile-hotspot"
+}

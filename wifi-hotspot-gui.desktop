@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Wi-Fi Hotspot
+GenericName=Hotspot manager
+Comment=Share Wi-Fi as a hotspot while staying connected
+Exec=wifi-hotspot-gui
+Icon=network-wireless-hotspot-symbolic
+Terminal=false
+Categories=Network;GTK;
+Keywords=hotspot;wifi;access point;tethering;share;
+StartupNotify=true
+StartupWMClass=io.github.linux_mobile_hotspot

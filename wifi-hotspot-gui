@@ -1,0 +1,627 @@
+#!/usr/bin/env python3
+# wifi-hotspot-gui - GTK4/libadwaita front end for wifi-hotspot.
+# Shows hotspot state and connected stations; starts/stops the hotspot and edits settings.
+# License: MIT
+#
+#   wifi-hotspot-gui            open the window
+#   wifi-hotspot-gui --json     print collected state as JSON and exit (no display needed)
+#   wifi-hotspot-gui --askpass  password prompt for sudo (used internally via SUDO_ASKPASS)
+
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import threading
+import time
+
+APP_ID = "io.github.linux_mobile_hotspot"
+CONF_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "wifi-hotspot")
+SETTINGS = os.path.join(CONF_DIR, "settings")
+RUN_DIR = os.path.join(CONF_DIR, "run")
+OUI_FILES = ["/usr/share/ieee-data/oui.txt", "/usr/share/hwdata/oui.txt", "/usr/share/misc/oui.txt"]
+DEFAULTS = {"SSID": "LinuxHotspot", "PASSWORD": "change-me-please", "BAND": "auto", "SECURITY": "wpa2",
+            "WIFI_IFACE": "", "AP_IFACE": "ap0", "SUBNET": "192.168.50", "DNS": "8.8.8.8,1.1.1.1"}
+SECURITY_MODES = ["wpa2", "wpa3", "wpa2-wpa3", "open"]
+BANDS = ["auto", "2.4", "5"]
+REFRESH_SECONDS = 2
+
+
+# ---------------------------------------------------------------- data collection (no GTK)
+
+def read_kv(path):
+    """Parse a KEY=value shell file (the subset written by wifi-hotspot / settings.example)."""
+    out = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                m = re.match(r"^([A-Z_][A-Z0-9_]*)=(.*)$", line)
+                if not m:
+                    continue
+                try:
+                    vals = shlex.split(m.group(2), comments=True)
+                except ValueError:
+                    continue
+                out[m.group(1)] = vals[0] if vals else ""
+    except OSError:
+        pass
+    return out
+
+
+def load_settings():
+    s = dict(DEFAULTS)
+    s.update(read_kv(SETTINGS))
+    return s
+
+
+def save_settings(updates):
+    """Replace/append KEY=value lines, keeping comments and unknown keys intact."""
+    os.makedirs(CONF_DIR, mode=0o700, exist_ok=True)
+    try:
+        with open(SETTINGS) as f:
+            lines = f.read().splitlines()
+    except OSError:
+        lines = []
+    done = set()
+    for i, line in enumerate(lines):
+        m = re.match(r"^([A-Z_][A-Z0-9_]*)=", line.strip())
+        if m and m.group(1) in updates:
+            lines[i] = f"{m.group(1)}={shlex.quote(updates[m.group(1)])}"
+            done.add(m.group(1))
+    for k, v in updates.items():
+        if k not in done:
+            lines.append(f"{k}={shlex.quote(v)}")
+    fd = os.open(SETTINGS, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    os.chmod(SETTINGS, 0o600)
+
+
+def run(cmd, timeout=2):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+
+
+def detect_wifi(settings):
+    if settings.get("WIFI_IFACE"):
+        return settings["WIFI_IFACE"]
+    iface = None
+    for line in run(["iw", "dev"]).splitlines():
+        line = line.strip()
+        if line.startswith("Interface "):
+            iface = line.split()[1]
+        elif line == "type managed" and iface and iface != settings.get("AP_IFACE"):
+            return iface
+    return ""
+
+
+def iface_info(iface):
+    """ssid / channel / freq / type from `iw dev <iface> info`."""
+    info = {}
+    for line in run(["iw", "dev", iface, "info"]).splitlines():
+        line = line.strip()
+        if line.startswith("ssid "):
+            info["ssid"] = line[5:]
+        elif line.startswith("type "):
+            info["type"] = line[5:]
+        elif line.startswith("channel "):
+            m = re.match(r"channel (\d+) \((\d+) MHz\)(?:, width: (\S+ MHz))?", line)
+            if m:
+                info["channel"] = int(m.group(1))
+                info["freq"] = int(m.group(2))
+                info["width"] = m.group(3) or ""
+    return info
+
+
+def upstream_link(iface):
+    link = {"connected": False}
+    for line in run(["iw", "dev", iface, "link"]).splitlines():
+        line = line.strip()
+        if line.startswith("Connected to"):
+            link["connected"] = True
+        elif line.startswith("SSID:"):
+            link["ssid"] = line[5:].strip()
+        elif line.startswith("signal:"):
+            link["signal"] = int(line.split()[1])
+        elif line.startswith("freq:"):
+            link["freq"] = int(float(line.split()[1]))
+    return link
+
+
+def parse_stations(text):
+    stations, cur = [], None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.startswith("Station "):
+            cur = {"mac": line.split()[1].lower()}
+            stations.append(cur)
+            continue
+        if cur is None or ":" not in line:
+            continue
+        key, _, val = line.partition(":")
+        key, val = key.strip(), val.strip()
+        num = re.match(r"-?\d+", val)
+        if key in ("rx bytes", "tx bytes", "rx packets", "tx packets", "tx retries", "tx failed") and num:
+            cur[key.replace(" ", "_")] = int(num.group())
+        elif key == "signal" and num:
+            cur["signal"] = int(num.group())
+        elif key == "signal avg" and num:
+            cur["signal_avg"] = int(num.group())
+        elif key in ("tx bitrate", "rx bitrate"):
+            cur[key.replace(" ", "_")] = val
+        elif key == "connected time" and num:
+            cur["connected_time"] = int(num.group())
+        elif key == "inactive time" and num:
+            cur["inactive_ms"] = int(num.group())
+    return stations
+
+
+def read_leases(path):
+    leases = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                p = line.split()
+                if len(p) >= 4:
+                    leases[p[1].lower()] = {"expires": int(p[0]) if p[0].isdigit() else 0, "ip": p[2],
+                                            "hostname": "" if p[3] == "*" else p[3]}
+    except OSError:
+        pass
+    return leases
+
+
+_oui = None
+
+
+def vendor(mac):
+    global _oui
+    first = int(mac[:2], 16)
+    if first & 0x02:
+        return "Private (randomized) address"
+    if _oui is None:
+        _oui = {}
+        for path in OUI_FILES:
+            try:
+                with open(path, encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        if "(hex)" in line:
+                            prefix, _, name = line.partition("(hex)")
+                            _oui[prefix.strip().replace("-", ":").lower()] = name.strip()
+                break
+            except OSError:
+                continue
+    return _oui.get(mac[:8], "Unknown vendor")
+
+
+def band_of(freq):
+    if not freq:
+        return ""
+    if freq < 3000:
+        return "2.4 GHz"
+    if freq < 5950:
+        return "5 GHz"
+    return "6 GHz"
+
+
+def collect():
+    settings = load_settings()
+    ap = settings["AP_IFACE"]
+    wifi = detect_wifi(settings)
+    state = read_kv(os.path.join(RUN_DIR, "state"))
+    info = iface_info(ap)
+    # ap0 in AP mode but without ssid/channel: hostapd was knocked off the air, usually because the
+    # client interface moved to another channel (single-channel hardware).
+    running = info.get("type") == "AP" and bool(info.get("ssid"))
+    interrupted = info.get("type") == "AP" and not info.get("ssid")
+    upstream = upstream_link(wifi) if wifi else {"connected": False}
+    leases = read_leases(os.path.join(RUN_DIR, "dnsmasq.leases"))
+    devices = []
+    if running:
+        for st in parse_stations(run(["iw", "dev", ap, "station", "dump"])):
+            lease = leases.get(st["mac"], {})
+            st.update(ip=lease.get("ip", ""), hostname=lease.get("hostname", ""),
+                      lease_expires=lease.get("expires", 0), vendor=vendor(st["mac"]))
+            devices.append(st)
+    return {
+        "running": running,
+        "interrupted": interrupted,
+        "ap_iface": ap,
+        "ssid": info.get("ssid", ""),
+        "channel": info.get("channel"),
+        "band": band_of(info.get("freq")),
+        "width": info.get("width", ""),
+        "security": state.get("SECURITY", settings["SECURITY"]) if running else settings["SECURITY"],
+        "started": int(state["STARTED"]) if running and state.get("STARTED", "").isdigit() else None,
+        "gateway": f'{state.get("SUBNET", settings["SUBNET"])}.1',
+        "wifi_iface": wifi,
+        "upstream": upstream,
+        "devices": devices,
+        "settings_file": SETTINGS,
+    }
+
+
+def human_bytes(n):
+    n = float(n or 0)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+
+
+def human_duration(sec):
+    sec = int(sec or 0)
+    h, rem = divmod(sec, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}h {m}m"
+    if m:
+        return f"{m}m {s}s"
+    return f"{s}s"
+
+
+def signal_quality(dbm):
+    if dbm is None:
+        return "", "network-wireless-signal-none-symbolic"
+    if dbm >= -55:
+        return "Excellent", "network-wireless-signal-excellent-symbolic"
+    if dbm >= -67:
+        return "Good", "network-wireless-signal-good-symbolic"
+    if dbm >= -75:
+        return "Fair", "network-wireless-signal-ok-symbolic"
+    return "Weak", "network-wireless-signal-weak-symbolic"
+
+
+def cli_path():
+    here = os.path.join(os.path.dirname(os.path.realpath(__file__)), "wifi-hotspot")
+    if os.access(here, os.X_OK):
+        return here
+    return shutil.which("wifi-hotspot") or "wifi-hotspot"
+
+
+# ---------------------------------------------------------------- GTK
+
+def gtk_imports():
+    import gi
+    gi.require_version("Gtk", "4.0")
+    gi.require_version("Adw", "1")
+    from gi.repository import Adw, GLib, Gtk
+    return Adw, GLib, Gtk
+
+
+def askpass_main(prompt):
+    """SUDO_ASKPASS helper: print the password on stdout, exit 1 on cancel."""
+    Adw, GLib, Gtk = gtk_imports()
+    result = {"pw": None}
+    app = Adw.Application(application_id=APP_ID + ".askpass")
+
+    def activate(app):
+        win = Adw.Window(application=app, title="Authentication required", modal=True,
+                         default_width=380, resizable=False)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12,
+                      margin_top=18, margin_bottom=18, margin_start=18, margin_end=18)
+        box.append(Gtk.Image(icon_name="dialog-password-symbolic", pixel_size=48))
+        box.append(Gtk.Label(label="Administrator privileges are needed to change network settings.",
+                             wrap=True, justify=Gtk.Justification.CENTER))
+        lb = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE, css_classes=["boxed-list"])
+        entry = Adw.PasswordEntryRow(title=(prompt or "Password").strip().rstrip(":"))
+        lb.append(entry)
+        box.append(lb)
+        btns = Gtk.Box(spacing=12, halign=Gtk.Align.END)
+        cancel = Gtk.Button(label="Cancel")
+        ok = Gtk.Button(label="Authenticate", css_classes=["suggested-action"])
+        btns.append(cancel)
+        btns.append(ok)
+        box.append(btns)
+        win.set_content(box)
+
+        def submit(*_):
+            result["pw"] = entry.get_text()
+            win.close()
+
+        ok.connect("clicked", submit)
+        entry.connect("entry-activated", submit)
+        cancel.connect("clicked", lambda *_: win.close())
+        win.present()
+        entry.grab_focus()
+
+    app.connect("activate", activate)
+    app.run([])
+    if result["pw"] is None:
+        sys.exit(1)
+    sys.stdout.write(result["pw"] + "\n")
+    sys.exit(0)
+
+
+def gui_main():
+    Adw, GLib, Gtk = gtk_imports()
+
+    class DeviceRow(Adw.ExpanderRow):
+        FIELDS = [("ip", "IP address"), ("mac", "MAC address"), ("vendor", "Vendor"),
+                  ("hostname", "Hostname"), ("signal", "Signal"), ("tx_bitrate", "Link speed (to device)"),
+                  ("rx_bitrate", "Link speed (from device)"), ("download", "Downloaded by device"),
+                  ("upload", "Uploaded by device"), ("packets", "Packets (rx / tx)"),
+                  ("retries", "TX retries / failed"), ("connected", "Connected for"),
+                  ("inactive", "Last activity"), ("lease", "DHCP lease expires")]
+
+        def __init__(self):
+            super().__init__()
+            self.icon = Gtk.Image(icon_name="network-wireless-signal-none-symbolic")
+            self.add_prefix(self.icon)
+            self.summary = Gtk.Label(css_classes=["dim-label", "numeric"])
+            (self.add_suffix if hasattr(self, "add_suffix") else self.add_action)(self.summary)
+            self.labels = {}
+            for key, title in self.FIELDS:
+                row = Adw.ActionRow(title=title)
+                lbl = Gtk.Label(selectable=True, css_classes=["dim-label"], xalign=1, wrap=True, max_width_chars=40)
+                row.add_suffix(lbl)
+                self.add_row(row)
+                self.labels[key] = lbl
+
+        def update(self, d):
+            name = d["hostname"] or d["ip"] or "Unknown device"
+            self.set_title(GLib.markup_escape_text(name))
+            self.set_subtitle(GLib.markup_escape_text(f'{d["ip"] or "no IP yet"} · {d["mac"]}'))
+            quality, icon = signal_quality(d.get("signal"))
+            self.icon.set_from_icon_name(icon)
+            sig = f'{d["signal"]} dBm' if d.get("signal") is not None else "-"
+            self.summary.set_label(f'{sig}  ↓{human_bytes(d.get("tx_bytes"))}  ↑{human_bytes(d.get("rx_bytes"))}')
+            exp = d.get("lease_expires")
+            vals = {
+                "ip": d["ip"] or "-",
+                "mac": d["mac"],
+                "vendor": d["vendor"],
+                "hostname": d["hostname"] or "-",
+                "signal": f"{sig} ({quality})" if quality else sig,
+                "tx_bitrate": d.get("tx_bitrate", "-"),
+                "rx_bitrate": d.get("rx_bitrate", "-"),
+                "download": human_bytes(d.get("tx_bytes")),
+                "upload": human_bytes(d.get("rx_bytes")),
+                "packets": f'{d.get("rx_packets", 0)} / {d.get("tx_packets", 0)}',
+                "retries": f'{d.get("tx_retries", 0)} / {d.get("tx_failed", 0)}',
+                "connected": human_duration(d.get("connected_time")),
+                "inactive": f'{d.get("inactive_ms", 0) / 1000:.1f}s ago',
+                "lease": time.strftime("%Y-%m-%d %H:%M", time.localtime(exp)) if exp else "-",
+            }
+            for k, v in vals.items():
+                self.labels[k].set_label(str(v))
+
+    class SettingsWindow(Adw.Window):
+        def __init__(self, parent, on_saved):
+            super().__init__(transient_for=parent, modal=True, title="Hotspot settings",
+                             default_width=460, default_height=520)
+            self.on_saved = on_saved
+            s = load_settings()
+            header = Adw.HeaderBar()
+            save = Gtk.Button(label="Save", css_classes=["suggested-action"])
+            header.pack_end(save)
+            page = Adw.PreferencesPage()
+            net = Adw.PreferencesGroup(title="Network")
+            self.ssid = Adw.EntryRow(title="Name (SSID)", text=s["SSID"])
+            self.pw = Adw.PasswordEntryRow(title="Password", text=s["PASSWORD"])
+            net.add(self.ssid)
+            net.add(self.pw)
+            gen = Gtk.Button(icon_name="view-refresh-symbolic", valign=Gtk.Align.CENTER,
+                             tooltip_text="Generate a random password", css_classes=["flat"])
+            gen.connect("clicked", self.generate)
+            self.pw.add_suffix(gen)
+            radio = Adw.PreferencesGroup(title="Radio",
+                                         description="While Wi-Fi is connected the hotspot always uses the "
+                                                     "Wi-Fi's channel; Band applies only when disconnected.")
+            self.band = Adw.ComboRow(title="Band", model=Gtk.StringList.new(["Auto", "2.4 GHz", "5 GHz"]))
+            self.band.set_selected(BANDS.index(s["BAND"]) if s["BAND"] in BANDS else 0)
+            self.sec = Adw.ComboRow(title="Security", model=Gtk.StringList.new(
+                ["WPA2-Personal", "WPA3-Personal (SAE)", "WPA2/WPA3 transition", "Open (no password)"]))
+            self.sec.set_selected(SECURITY_MODES.index(s["SECURITY"]) if s["SECURITY"] in SECURITY_MODES else 0)
+            radio.add(self.band)
+            radio.add(self.sec)
+            page.add(net)
+            page.add(radio)
+            self.error = Gtk.Label(css_classes=["error"], wrap=True, visible=False, margin_top=6)
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+            box.append(header)
+            box.append(self.error)
+            box.append(page)
+            page.set_vexpand(True)
+            self.set_content(box)
+            save.connect("clicked", self.save)
+
+        def generate(self, *_):
+            import secrets
+            import string
+            alphabet = string.ascii_letters + string.digits
+            self.pw.set_text("".join(secrets.choice(alphabet) for _ in range(16)))
+
+        def save(self, *_):
+            ssid, pw = self.ssid.get_text(), self.pw.get_text()
+            sec = SECURITY_MODES[self.sec.get_selected()]
+            err = None
+            if not 1 <= len(ssid.encode()) <= 32:
+                err = "SSID must be 1-32 bytes."
+            elif sec != "open" and not 8 <= len(pw) <= 63:
+                err = "Password must be 8-63 characters."
+            if err:
+                self.error.set_label(err)
+                self.error.set_visible(True)
+                return
+            save_settings({"SSID": ssid, "PASSWORD": pw, "BAND": BANDS[self.band.get_selected()], "SECURITY": sec})
+            self.close()
+            self.on_saved()
+
+    class MainWindow(Adw.ApplicationWindow):
+        def __init__(self, app):
+            super().__init__(application=app, title="Wi-Fi Hotspot", default_width=560, default_height=680)
+            self.rows = {}
+            self.busy = False
+
+            header = Adw.HeaderBar()
+            self.toggle = Gtk.Button(label="Start")
+            self.toggle.connect("clicked", self.on_toggle)
+            header.pack_start(self.toggle)
+            self.spinner = Gtk.Spinner()
+            header.pack_start(self.spinner)
+            settings_btn = Gtk.Button(icon_name="emblem-system-symbolic", tooltip_text="Settings")
+            settings_btn.connect("clicked", lambda *_: SettingsWindow(self, self.on_settings_saved).present())
+            header.pack_end(settings_btn)
+
+            page = Adw.PreferencesPage()
+            self.status_group = Adw.PreferencesGroup(title="Hotspot")
+            self.r_state = self._info_row(self.status_group, "Status")
+            self.r_ssid = self._info_row(self.status_group, "Network name")
+            self.r_radio = self._info_row(self.status_group, "Band / channel")
+            self.r_sec = self._info_row(self.status_group, "Security")
+            self.r_gw = self._info_row(self.status_group, "Gateway address")
+            self.r_up = self._info_row(self.status_group, "Uptime")
+            up_group = Adw.PreferencesGroup(title="Internet source")
+            self.r_wifi = self._info_row(up_group, "Wi-Fi")
+            self.r_wifi_sig = self._info_row(up_group, "Signal / band")
+            self.dev_group = Adw.PreferencesGroup(title="Connected devices")
+            self.empty = Adw.ActionRow(title="No devices connected")
+            self.empty.add_css_class("dim-label")
+            self.dev_group.add(self.empty)
+            for g in (self.status_group, up_group, self.dev_group):
+                page.add(g)
+
+            self.toasts = Adw.ToastOverlay(child=page)
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+            box.append(header)
+            box.append(self.toasts)
+            self.toasts.set_vexpand(True)
+            self.set_content(box)
+
+            self.refresh()
+            GLib.timeout_add_seconds(REFRESH_SECONDS, self.refresh)
+
+        def _info_row(self, group, title):
+            row = Adw.ActionRow(title=title)
+            lbl = Gtk.Label(selectable=True, css_classes=["dim-label"], xalign=1)
+            row.add_suffix(lbl)
+            group.add(row)
+            return lbl
+
+        def toast(self, msg):
+            self.toasts.add_toast(Adw.Toast(title=GLib.markup_escape_text(msg), timeout=4))
+
+        def refresh(self):
+            threading.Thread(target=lambda: GLib.idle_add(self.apply, collect()), daemon=True).start()
+            return True
+
+        def apply(self, d):
+            run_ = d["running"]
+            if d["interrupted"]:
+                ch = d["upstream"].get("freq")
+                self.r_state.set_label(f"Interrupted: Wi-Fi moved to {band_of(ch)}, press Restart")
+            else:
+                self.r_state.set_label("Running" if run_ else "Stopped")
+            self.r_ssid.set_label(d["ssid"] or load_settings()["SSID"])
+            self.r_radio.set_label(f'{d["band"]}, channel {d["channel"]}' if run_ else "-")
+            self.r_sec.set_label({"wpa2": "WPA2-Personal", "wpa3": "WPA3-Personal (SAE)",
+                                  "wpa2-wpa3": "WPA2/WPA3 transition", "open": "Open"}.get(d["security"], d["security"]))
+            self.r_gw.set_label(d["gateway"] if run_ else "-")
+            self.r_up.set_label(human_duration(time.time() - d["started"]) if d["started"] else "-")
+            u = d["upstream"]
+            if u.get("connected"):
+                self.r_wifi.set_label(f'{u.get("ssid", "")} ({d["wifi_iface"]})')
+                self.r_wifi_sig.set_label(f'{u.get("signal", "?")} dBm, {band_of(u.get("freq"))}')
+            else:
+                self.r_wifi.set_label(f'Not connected ({d["wifi_iface"] or "no Wi-Fi interface"})')
+                self.r_wifi_sig.set_label("-")
+            if not self.busy:
+                self.toggle.set_label("Restart" if d["interrupted"] else "Stop" if run_ else "Start")
+                for c in ("suggested-action", "destructive-action"):
+                    self.toggle.remove_css_class(c)
+                self.toggle.add_css_class("destructive-action" if run_ else "suggested-action")
+
+            seen = set()
+            for dev in d["devices"]:
+                seen.add(dev["mac"])
+                row = self.rows.get(dev["mac"])
+                if row is None:
+                    row = self.rows[dev["mac"]] = DeviceRow()
+                    self.dev_group.add(row)
+                row.update(dev)
+            for mac in list(self.rows):
+                if mac not in seen:
+                    self.dev_group.remove(self.rows.pop(mac))
+            self.empty.set_visible(not self.rows)
+            self.dev_group.set_title(f"Connected devices ({len(self.rows)})")
+            return False
+
+        def on_toggle(self, *_):
+            action = {"Stop": "stop", "Restart": "restart"}.get(self.toggle.get_label(), "start")
+            s = load_settings()
+            if action != "stop" and s["SECURITY"] != "open" and s["PASSWORD"] == DEFAULTS["PASSWORD"]:
+                self.toast("Set a hotspot password first")
+                SettingsWindow(self, self.on_settings_saved).present()
+                return
+            self.run_cli(action)
+
+        def on_settings_saved(self):
+            if self.toggle.get_label() == "Stop":
+                self.toast("Settings saved, restarting hotspot")
+                self.run_cli("restart")
+            else:
+                self.toast("Settings saved")
+
+        def run_cli(self, action):
+            if self.busy:
+                return
+            self.busy = True
+            self.toggle.set_sensitive(False)
+            self.spinner.start()
+            env = dict(os.environ, SUDO_ASKPASS=os.path.realpath(__file__), NO_COLOR="1")
+
+            def work():
+                try:
+                    p = subprocess.run([cli_path(), action], stdin=subprocess.DEVNULL, capture_output=True,
+                                       text=True, env=env, timeout=90)
+                    out = (p.stdout + p.stderr).strip()
+                    ok = p.returncode == 0
+                except (OSError, subprocess.TimeoutExpired) as e:
+                    out, ok = str(e), False
+                GLib.idle_add(self.cli_done, action, ok, out)
+
+            threading.Thread(target=work, daemon=True).start()
+
+        def cli_done(self, action, ok, out):
+            self.busy = False
+            self.toggle.set_sensitive(True)
+            self.spinner.stop()
+            last = re.sub(r"\x1b\[[0-9;]*m", "", out).strip().splitlines()[-1:] or [""]
+            if ok:
+                self.toast(last[0] or f"{action} done")
+            else:
+                dlg = Adw.MessageDialog(transient_for=self, heading=f"Could not {action} the hotspot",
+                                        body=re.sub(r"\x1b\[[0-9;]*m", "", out)[-1500:] or "Unknown error")
+                dlg.add_response("close", "Close")
+                dlg.present()
+            self.refresh()
+            return False
+
+    app = Adw.Application(application_id=APP_ID)
+    app.connect("activate", lambda a: (a.get_active_window() or MainWindow(a)).present())
+    return app.run([sys.argv[0]])
+
+
+def main():
+    args = sys.argv[1:]
+    if args[:1] == ["--json"]:
+        print(json.dumps(collect(), indent=2))
+        return 0
+    if args[:1] == ["--askpass"] or (args and not args[0].startswith("-")):
+        # sudo -A calls the askpass program with the prompt as its only argument
+        askpass_main(args[1] if args[:1] == ["--askpass"] and len(args) > 1 else (args[0] if args else ""))
+    if args[:1] in (["-h"], ["--help"]):
+        print(__doc__ or "usage: wifi-hotspot-gui [--json]")
+        return 0
+    return gui_main()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
